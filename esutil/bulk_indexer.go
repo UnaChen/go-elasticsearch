@@ -211,9 +211,6 @@ func (bi *bulkIndexer) Add(ctx context.Context, item BulkIndexerItem) error {
 
 	select {
 	case <-ctx.Done():
-		if bi.config.OnError != nil {
-			bi.config.OnError(ctx, ctx.Err())
-		}
 		return ctx.Err()
 	case bi.queue <- item:
 	}
@@ -231,9 +228,6 @@ func (bi *bulkIndexer) Close(ctx context.Context) error {
 
 	select {
 	case <-ctx.Done():
-		if bi.config.OnError != nil {
-			bi.config.OnError(ctx, ctx.Err())
-		}
 		return ctx.Err()
 	default:
 		bi.wg.Wait()
@@ -427,9 +421,6 @@ func (w *worker) writeBody(item *BulkIndexerItem) error {
 		}
 
 		if _, err := w.buf.ReadFrom(item.Body); err != nil {
-			if w.bi.config.OnError != nil {
-				w.bi.config.OnError(context.Background(), err)
-			}
 			return err
 		}
 		w.buf.WriteRune('\n')
@@ -496,9 +487,6 @@ func (w *worker) flush(ctx context.Context) error {
 	res, err := req.Do(ctx, w.bi.config.Client)
 	if err != nil {
 		atomic.AddUint64(&w.bi.stats.numFailed, uint64(len(w.items)))
-		if w.bi.config.OnError != nil {
-			w.bi.config.OnError(ctx, fmt.Errorf("flush: %s", err))
-		}
 		return fmt.Errorf("flush: %s", err)
 	}
 	if res.Body != nil {
@@ -507,17 +495,11 @@ func (w *worker) flush(ctx context.Context) error {
 	if res.IsError() {
 		atomic.AddUint64(&w.bi.stats.numFailed, uint64(len(w.items)))
 		// TODO(karmi): Wrap error (include response struct)
-		if w.bi.config.OnError != nil {
-			w.bi.config.OnError(ctx, fmt.Errorf("flush: %s", err))
-		}
 		return fmt.Errorf("flush: %s", res.String())
 	}
 
 	if err := w.bi.config.Decoder.UnmarshalFromReader(res.Body, &blk); err != nil {
 		// TODO(karmi): Wrap error (include response struct)
-		if w.bi.config.OnError != nil {
-			w.bi.config.OnError(ctx, fmt.Errorf("flush: %s", err))
-		}
 		return fmt.Errorf("flush: error parsing response body: %s", err)
 	}
 
