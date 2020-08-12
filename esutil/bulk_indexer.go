@@ -340,14 +340,7 @@ func (w *worker) run() {
 				w.bi.config.DebugLogger.Printf("[worker-%03d] Received item [%s:%s]\n", w.id, item.Action, item.DocumentID)
 			}
 
-			if err := w.writeMeta(item); err != nil {
-				if item.OnFailure != nil {
-					item.OnFailure(ctx, item, BulkIndexerResponseItem{}, err)
-				}
-				atomic.AddUint64(&w.bi.stats.numFailed, 1)
-				w.mu.Unlock()
-				continue
-			}
+			w.writeMeta(item)
 
 			if err := w.writeBody(&item); err != nil {
 				if item.OnFailure != nil {
@@ -375,7 +368,7 @@ func (w *worker) run() {
 
 // writeMeta formats and writes the item metadata to the buffer; it must be called under a lock.
 //
-func (w *worker) writeMeta(item BulkIndexerItem) error {
+func (w *worker) writeMeta(item BulkIndexerItem) {
 	w.buf.WriteRune('{')
 	w.aux = strconv.AppendQuote(w.aux, item.Action)
 	w.buf.Write(w.aux)
@@ -400,7 +393,6 @@ func (w *worker) writeMeta(item BulkIndexerItem) error {
 	w.buf.WriteRune('}')
 	w.buf.WriteRune('}')
 	w.buf.WriteRune('\n')
-	return nil
 }
 
 // writeBody writes the item body to the buffer; it must be called under a lock.

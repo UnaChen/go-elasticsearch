@@ -616,9 +616,7 @@ func TestBulkIndexer(t *testing.T) {
 					buf: bytes.NewBuffer(make([]byte, 0, 5e+6)),
 					aux: make([]byte, 0, 512),
 				}
-				if err := w.writeMeta(tt.args.item); err != nil {
-					t.Errorf("Unexpected error: %v", err)
-				}
+				w.writeMeta(tt.args.item)
 
 				if w.buf.String() != tt.want {
 					t.Errorf("worker.writeMeta() %s = got [%s], want [%s]", tt.name, w.buf.String(), tt.want)
