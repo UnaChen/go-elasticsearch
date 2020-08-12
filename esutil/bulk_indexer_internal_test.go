@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -209,7 +210,10 @@ func TestBulkIndexer(t *testing.T) {
 		biCfg := BulkIndexerConfig{
 			NumWorkers: 1,
 			Client:     es,
-			OnError:    func(ctx context.Context, err error) { indexerError = err },
+			OnFlushRetry: func(ctx context.Context, stats BulkIndexerRetryStats, err error) error {
+				indexerError = err
+				return nil
+			},
 		}
 		if os.Getenv("DEBUG") != "" {
 			biCfg.DebugLogger = log.New(os.Stdout, "", 0)
@@ -384,6 +388,41 @@ func TestBulkIndexer(t *testing.T) {
 					duration = time.Since(v.(time.Time))
 				}
 				fmt.Printf(">>> Flush finished (duration: %s)\n", duration)
+			},
+		})
+
+		err := bi.Add(context.Background(), BulkIndexerItem{
+			Action: "index",
+			Body:   strings.NewReader(`{"title":"foo"}`),
+		})
+		if err != nil {
+			t.Fatalf("Unexpected error: %s", err)
+		}
+
+		if err := bi.Close(context.Background()); err != nil {
+			t.Errorf("Unexpected error: %s", err)
+		}
+
+		stats := bi.Stats()
+
+		if stats.NumAdded != uint64(1) {
+			t.Errorf("Unexpected NumAdded: %d", stats.NumAdded)
+		}
+	})
+
+	t.Run("OnFlushRetry callbacks", func(t *testing.T) {
+		es, _ := elasticsearch.NewClient(elasticsearch.Config{Transport: &mockTransport{}})
+		bi, _ := NewBulkIndexer(BulkIndexerConfig{
+			Client:     es,
+			Index:      "foo",
+			FlushBytes: 1,
+			OnFlushRetry: func(ctx context.Context, stats BulkIndexerRetryStats, err error) error {
+				if stats.Count < 3 {
+					fmt.Printf(">>> Flush retry %d: FlushBytes(%d), NumFailed(%d), NumAdded(%d), in %d ms\n", stats.Count, stats.FlushBytes, stats.NumFailed, stats.NumAdded, stats.Duration)
+
+					return errors.New("retry error")
+				}
+				return nil
 			},
 		})
 

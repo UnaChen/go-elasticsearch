@@ -52,9 +52,10 @@ type BulkIndexerConfig struct {
 	Decoder     BulkResponseJSONDecoder // A custom JSON decoder.
 	DebugLogger BulkIndexerDebugLogger  // An optional logger for debugging.
 
-	OnError      func(context.Context, error)          // Called for indexer errors.
-	OnFlushStart func(context.Context) context.Context // Called when the flush starts.
-	OnFlushEnd   func(context.Context)                 // Called when the flush ends.
+	// OnError      func(context.Context, error)                              // Called for indexer errors.
+	OnFlushStart func(context.Context) context.Context                     // Called when the flush starts.
+	OnFlushEnd   func(context.Context)                                     // Called when the flush ends.
+	OnFlushRetry func(context.Context, BulkIndexerRetryStats, error) error // Called when items failed after flushed
 
 	// Parameters of the Bulk API.
 	Index               string
@@ -71,6 +72,16 @@ type BulkIndexerConfig struct {
 	SourceIncludes      []string
 	Timeout             time.Duration
 	WaitForActiveShards string
+}
+
+// BulkIndexerStats represents the indexer flush retry statistics.
+//
+type BulkIndexerRetryStats struct {
+	Count      uint64
+	FlushBytes uint64
+	NumAdded   uint64
+	NumFailed  uint64
+	Duration   uint64 //time in milliseconds
 }
 
 // BulkIndexerStats represents the indexer statistics.
@@ -191,6 +202,12 @@ func NewBulkIndexer(cfg BulkIndexerConfig) (BulkIndexer, error) {
 		cfg.FlushInterval = 30 * time.Second
 	}
 
+	if cfg.OnFlushRetry == nil {
+		cfg.OnFlushRetry = func(context.Context, BulkIndexerRetryStats, error) error {
+			return nil
+		}
+	}
+
 	bi := bulkIndexer{
 		config: cfg,
 		done:   make(chan bool),
@@ -236,13 +253,7 @@ func (bi *bulkIndexer) Close(ctx context.Context) error {
 	for _, w := range bi.workers {
 		w.mu.Lock()
 		if w.buf.Len() > 0 {
-			if err := w.flush(ctx); err != nil {
-				w.mu.Unlock()
-				if bi.config.OnError != nil {
-					bi.config.OnError(ctx, err)
-				}
-				continue
-			}
+			w.flushRetry(ctx)
 		}
 		w.mu.Unlock()
 	}
@@ -295,13 +306,7 @@ func (bi *bulkIndexer) init() {
 				for _, w := range bi.workers {
 					w.mu.Lock()
 					if w.buf.Len() > 0 {
-						if err := w.flush(ctx); err != nil {
-							w.mu.Unlock()
-							if bi.config.OnError != nil {
-								bi.config.OnError(ctx, err)
-							}
-							continue
-						}
+						w.flushRetry(ctx)
 					}
 					w.mu.Unlock()
 				}
@@ -313,13 +318,14 @@ func (bi *bulkIndexer) init() {
 // worker represents an indexer worker.
 //
 type worker struct {
-	id    int
-	ch    <-chan BulkIndexerItem
-	mu    sync.Mutex
-	bi    *bulkIndexer
-	buf   *bytes.Buffer
-	aux   []byte
-	items []BulkIndexerItem
+	id          int
+	ch          <-chan BulkIndexerItem
+	mu          sync.Mutex
+	bi          *bulkIndexer
+	buf         *bytes.Buffer
+	aux         []byte
+	items       []BulkIndexerItem
+	failedItems []BulkIndexerItem
 }
 
 // run launches the worker in a goroutine.
@@ -343,6 +349,7 @@ func (w *worker) run() {
 			w.writeMeta(item)
 
 			if err := w.writeBody(&item); err != nil {
+				w.failedItems = append(w.failedItems, item)
 				if item.OnFailure != nil {
 					item.OnFailure(ctx, item, BulkIndexerResponseItem{}, err)
 				}
@@ -353,17 +360,56 @@ func (w *worker) run() {
 
 			w.items = append(w.items, item)
 			if w.buf.Len() >= w.bi.config.FlushBytes {
-				if err := w.flush(ctx); err != nil {
-					w.mu.Unlock()
-					if w.bi.config.OnError != nil {
-						w.bi.config.OnError(ctx, err)
-					}
-					continue
-				}
+				w.flushRetry(ctx)
 			}
 			w.mu.Unlock()
 		}
 	}()
+}
+
+func (w *worker) flushRetry(ctx context.Context) {
+	defer func() {
+		w.failedItems = []BulkIndexerItem{}
+	}()
+
+	var count uint64
+	for {
+		flushBytes := uint64(w.buf.Len())
+		numAdded := uint64(len(w.items))
+
+		start := time.Now()
+		err := w.flush(ctx)
+
+		stats := BulkIndexerRetryStats{
+			Count:      count,
+			FlushBytes: flushBytes,
+			NumAdded:   numAdded,
+			NumFailed:  uint64(len(w.failedItems)),
+			Duration:   uint64(time.Since(start).Milliseconds()),
+		}
+		if err := w.bi.config.OnFlushRetry(ctx, stats, err); err == nil {
+			break
+		}
+
+		w.writeFailedItems(ctx)
+		count++
+	}
+}
+
+func (w *worker) writeFailedItems(ctx context.Context) {
+	failedItems := w.failedItems
+	w.failedItems = []BulkIndexerItem{}
+
+	for _, item := range failedItems {
+
+		w.writeMeta(item)
+
+		if err := w.writeBody(&item); err != nil {
+			w.failedItems = append(w.failedItems, item)
+			continue
+		}
+		w.items = append(w.items, item)
+	}
 }
 
 // writeMeta formats and writes the item metadata to the buffer; it must be called under a lock.
@@ -512,6 +558,7 @@ func (w *worker) flush(ctx context.Context) error {
 		}
 		if info.Error.Type != "" || info.Status > 201 {
 			atomic.AddUint64(&w.bi.stats.numFailed, 1)
+			w.failedItems = append(w.failedItems, item)
 			if item.OnFailure != nil {
 				item.OnFailure(ctx, item, info, nil)
 			}
