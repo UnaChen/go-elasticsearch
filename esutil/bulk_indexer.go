@@ -395,7 +395,7 @@ func (w *worker) flushRetry(ctx context.Context) error {
 		numAdded := uint64(len(w.items))
 
 		start := time.Now()
-		err := w.flush(ctx)
+		errFlush := w.flush(ctx)
 
 		stats := BulkIndexerRetryStats{
 			Count:      count,
@@ -404,11 +404,16 @@ func (w *worker) flushRetry(ctx context.Context) error {
 			NumFailed:  uint64(len(w.failedItems)),
 			Duration:   uint64(time.Since(start).Milliseconds()),
 		}
-		wait, goahead, err := w.bi.config.OnFlushRetry(ctx, stats, err)
+
+		if errFlush != nil {
+			stats.NumFailed = uint64(len(w.items))
+		}
+
+		wait, goahead, err := w.bi.config.OnFlushRetry(ctx, stats, errFlush)
 		if !goahead {
 			return err
 		}
-		time.Sleep(wait * time.Millisecond)
+		time.Sleep(wait)
 
 		w.writeFailedItems(ctx)
 		count++
