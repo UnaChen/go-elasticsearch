@@ -386,30 +386,31 @@ func (w *worker) run() {
 
 func (w *worker) flushRetry(ctx context.Context) error {
 	defer func() {
-		w.failedItems = []BulkIndexerItem{}
+		w.items = nil
+		w.failedItems = nil
 	}()
 
 	var count uint64
 	for {
 		flushBytes := uint64(w.buf.Len())
-		numAdded := uint64(len(w.items))
 
 		start := time.Now()
-		errFlush := w.flush(ctx)
+		err := w.flush(ctx)
+		if err != nil {
+			w.failedItems = w.items
+		}
 
 		stats := BulkIndexerRetryStats{
 			Count:      count,
 			FlushBytes: flushBytes,
-			NumAdded:   numAdded,
+			NumAdded:   uint64(len(w.items)),
 			NumFailed:  uint64(len(w.failedItems)),
 			Duration:   uint64(time.Since(start).Milliseconds()),
 		}
 
-		if errFlush != nil {
-			stats.NumFailed = uint64(len(w.items))
-		}
+		w.items = nil
 
-		wait, goahead, err := w.bi.config.OnFlushRetry(ctx, stats, errFlush)
+		wait, goahead, err := w.bi.config.OnFlushRetry(ctx, stats, err)
 		if !goahead {
 			return err
 		}
@@ -422,7 +423,7 @@ func (w *worker) flushRetry(ctx context.Context) error {
 
 func (w *worker) writeFailedItems(ctx context.Context) {
 	failedItems := w.failedItems
-	w.failedItems = []BulkIndexerItem{}
+	w.failedItems = nil
 
 	for _, item := range failedItems {
 
@@ -518,7 +519,6 @@ func (w *worker) flush(ctx context.Context) error {
 	)
 
 	defer func() {
-		w.items = w.items[:0]
 		w.buf.Reset()
 	}()
 
