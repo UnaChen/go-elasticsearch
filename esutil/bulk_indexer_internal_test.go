@@ -210,9 +210,9 @@ func TestBulkIndexer(t *testing.T) {
 		biCfg := BulkIndexerConfig{
 			NumWorkers: 1,
 			Client:     es,
-			OnFlushRetry: func(ctx context.Context, stats BulkIndexerRetryStats, err error) error {
+			OnFlushRetry: func(ctx context.Context, stats BulkIndexerRetryStats, err error) (time.Duration, bool, error) {
 				indexerError = err
-				return nil
+				return 0, false, nil
 			},
 		}
 		if os.Getenv("DEBUG") != "" {
@@ -411,18 +411,25 @@ func TestBulkIndexer(t *testing.T) {
 	})
 
 	t.Run("OnFlushRetry callbacks", func(t *testing.T) {
+		errRetryFailed := errors.New("retry fail")
+
 		es, _ := elasticsearch.NewClient(elasticsearch.Config{Transport: &mockTransport{}})
 		bi, _ := NewBulkIndexer(BulkIndexerConfig{
 			Client:     es,
 			Index:      "foo",
 			FlushBytes: 1,
-			OnFlushRetry: func(ctx context.Context, stats BulkIndexerRetryStats, err error) error {
+			OnFlushRetry: func(ctx context.Context, stats BulkIndexerRetryStats, err error) (time.Duration, bool, error) {
 				if stats.Count < 3 {
 					fmt.Printf(">>> Flush retry %d: FlushBytes(%d), NumFailed(%d), NumAdded(%d), in %d ms\n", stats.Count, stats.FlushBytes, stats.NumFailed, stats.NumAdded, stats.Duration)
 
-					return errors.New("retry error")
+					return 0, true, errRetryFailed
 				}
-				return nil
+				return 0, false, errRetryFailed
+			},
+			OnFlushRetryError: func(ctx context.Context, err error) {
+				if !errors.Is(err, errRetryFailed) {
+					t.Errorf("Unexpected OnFlushRetryError: want=%s, got=%s", errRetryFailed, err)
+				}
 			},
 		})
 

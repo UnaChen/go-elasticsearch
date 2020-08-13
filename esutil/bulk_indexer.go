@@ -52,10 +52,10 @@ type BulkIndexerConfig struct {
 	Decoder     BulkResponseJSONDecoder // A custom JSON decoder.
 	DebugLogger BulkIndexerDebugLogger  // An optional logger for debugging.
 
-	// OnError      func(context.Context, error)                              // Called for indexer errors.
-	OnFlushStart func(context.Context) context.Context                     // Called when the flush starts.
-	OnFlushEnd   func(context.Context)                                     // Called when the flush ends.
-	OnFlushRetry func(context.Context, BulkIndexerRetryStats, error) error // Called when items failed after flushed
+	OnFlushStart      func(context.Context) context.Context                                            // Called when the flush starts.
+	OnFlushEnd        func(context.Context)                                                            // Called when the flush ends.
+	OnFlushRetry      func(context.Context, BulkIndexerRetryStats, error) (time.Duration, bool, error) // Called when items failed after flushed
+	OnFlushRetryError func(context.Context, error)                                                     // Called when the flush retry error.
 
 	// Parameters of the Bulk API.
 	Index               string
@@ -203,8 +203,8 @@ func NewBulkIndexer(cfg BulkIndexerConfig) (BulkIndexer, error) {
 	}
 
 	if cfg.OnFlushRetry == nil {
-		cfg.OnFlushRetry = func(context.Context, BulkIndexerRetryStats, error) error {
-			return nil
+		cfg.OnFlushRetry = func(context.Context, BulkIndexerRetryStats, error) (time.Duration, bool, error) {
+			return 0, false, nil
 		}
 	}
 
@@ -251,11 +251,17 @@ func (bi *bulkIndexer) Close(ctx context.Context) error {
 	}
 
 	for _, w := range bi.workers {
+		var err error
+
 		w.mu.Lock()
 		if w.buf.Len() > 0 {
-			w.flushRetry(ctx)
+			err = w.flushRetry(ctx)
 		}
 		w.mu.Unlock()
+
+		if err != nil && bi.config.OnFlushRetryError != nil {
+			bi.config.OnFlushRetryError(ctx, err)
+		}
 	}
 	return nil
 }
@@ -304,11 +310,17 @@ func (bi *bulkIndexer) init() {
 					bi.config.DebugLogger.Printf("[indexer] Auto-flushing workers after %s\n", bi.config.FlushInterval)
 				}
 				for _, w := range bi.workers {
+					var err error
+
 					w.mu.Lock()
 					if w.buf.Len() > 0 {
-						w.flushRetry(ctx)
+						err = w.flushRetry(ctx)
 					}
 					w.mu.Unlock()
+
+					if err != nil && bi.config.OnFlushRetryError != nil {
+						bi.config.OnFlushRetryError(ctx, err)
+					}
 				}
 			}
 		}
@@ -357,17 +369,22 @@ func (w *worker) run() {
 				w.mu.Unlock()
 				continue
 			}
-
 			w.items = append(w.items, item)
+
+			var err error
 			if w.buf.Len() >= w.bi.config.FlushBytes {
-				w.flushRetry(ctx)
+				err = w.flushRetry(ctx)
 			}
 			w.mu.Unlock()
+
+			if err != nil && w.bi.config.OnFlushRetryError != nil {
+				w.bi.config.OnFlushRetryError(ctx, err)
+			}
 		}
 	}()
 }
 
-func (w *worker) flushRetry(ctx context.Context) {
+func (w *worker) flushRetry(ctx context.Context) error {
 	defer func() {
 		w.failedItems = []BulkIndexerItem{}
 	}()
@@ -387,9 +404,11 @@ func (w *worker) flushRetry(ctx context.Context) {
 			NumFailed:  uint64(len(w.failedItems)),
 			Duration:   uint64(time.Since(start).Milliseconds()),
 		}
-		if err := w.bi.config.OnFlushRetry(ctx, stats, err); err == nil {
-			break
+		wait, goahead, err := w.bi.config.OnFlushRetry(ctx, stats, err)
+		if !goahead {
+			return err
 		}
+		time.Sleep(wait * time.Millisecond)
 
 		w.writeFailedItems(ctx)
 		count++
