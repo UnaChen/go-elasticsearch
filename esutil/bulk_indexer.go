@@ -56,10 +56,10 @@ type BulkIndexerConfig struct {
 	Decoder     BulkResponseJSONDecoder // A custom JSON decoder.
 	DebugLogger BulkIndexerDebugLogger  // An optional logger for debugging.
 
-	OnFlushStart      func(context.Context) context.Context                                            // Called when the flush starts.
-	OnFlushEnd        func(context.Context)                                                            // Called when the flush ends.
-	OnFlushRetry      func(context.Context, BulkIndexerRetryStats, error) (time.Duration, bool, error) // Called when items failed after flushed
-	OnFlushRetryError func(context.Context, error)                                                     // Called when the flush retry error.
+	OnFlushStart    func(context.Context) context.Context                                            // Called when the flush starts.
+	OnFlushEnd      func(context.Context)                                                            // Called when the flush ends.
+	OnFlushRetry    func(context.Context, BulkIndexerRetryStats, error) (time.Duration, bool, error) // Called when items failed after flushed
+	OnFlushRetryEnd func(context.Context, int64, error)                                              // Called when the flush retry end (return duration, error).
 
 	// Parameters of the Bulk API.
 	Index               string
@@ -214,6 +214,10 @@ func NewBulkIndexer(cfg BulkIndexerConfig) (BulkIndexer, error) {
 		}
 	}
 
+	if cfg.OnFlushRetryEnd == nil {
+		cfg.OnFlushRetryEnd = func(context.Context, int64, error) {}
+	}
+
 	bi := bulkIndexer{
 		config: cfg,
 		stats:  &bulkIndexerStats{},
@@ -274,13 +278,10 @@ func (bi *bulkIndexer) Close(ctx context.Context) error {
 	}
 
 	for _, w := range bi.workers {
-		var err error
 		if w.buf.Len() > 0 {
-			err = w.flushRetry(ctx)
-		}
-
-		if err != nil && bi.config.OnFlushRetryError != nil {
-			bi.config.OnFlushRetryError(ctx, err)
+			start := time.Now()
+			err := w.flushRetry(ctx)
+			bi.config.OnFlushRetryEnd(ctx, time.Since(start).Milliseconds(), err)
 		}
 	}
 	return nil
@@ -358,10 +359,9 @@ func (w *worker) run(ctx context.Context) {
 				}
 
 				if w.buf.Len() > 0 {
+					start := time.Now()
 					err := w.flushRetry(ctx)
-					if err != nil && w.bi.config.OnFlushRetryError != nil {
-						w.bi.config.OnFlushRetryError(ctx, err)
-					}
+					w.bi.config.OnFlushRetryEnd(ctx, time.Since(start).Milliseconds(), err)
 				}
 
 			case item, ok := <-w.ch:
@@ -386,10 +386,9 @@ func (w *worker) run(ctx context.Context) {
 				w.items = append(w.items, item)
 
 				if w.buf.Len() >= w.bi.config.FlushBytes {
+					start := time.Now()
 					err := w.flushRetry(ctx)
-					if err != nil && w.bi.config.OnFlushRetryError != nil {
-						w.bi.config.OnFlushRetryError(ctx, err)
-					}
+					w.bi.config.OnFlushRetryEnd(ctx, time.Since(start).Milliseconds(), err)
 				}
 			}
 		}

@@ -449,8 +449,8 @@ func TestBulkIndexer(t *testing.T) {
 				}
 				return 0, false, errRetryFailed
 			},
-			OnFlushRetryError: func(ctx context.Context, err error) {
-				if !errors.Is(err, errRetryFailed) {
+			OnFlushRetryEnd: func(ctx context.Context, d int64, err error) {
+				if err != nil && !errors.Is(err, errRetryFailed) {
 					t.Errorf("Unexpected OnFlushRetryError: want=%s, got=%s", errRetryFailed, err)
 				}
 			},
