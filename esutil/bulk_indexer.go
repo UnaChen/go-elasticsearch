@@ -268,6 +268,7 @@ func (bi *bulkIndexer) Close(ctx context.Context) error {
 		return nil
 	}
 
+	bi.done = true
 	close(bi.queue)
 
 	select {
@@ -284,7 +285,6 @@ func (bi *bulkIndexer) Close(ctx context.Context) error {
 			bi.config.OnFlushRetryEnd(ctx, time.Since(start).Milliseconds(), err)
 		}
 	}
-	bi.done = true
 	return nil
 }
 
