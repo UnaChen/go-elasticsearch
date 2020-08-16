@@ -188,6 +188,29 @@ func TestBulkIndexer(t *testing.T) {
 		}
 	})
 
+	t.Run("ClosWithError() Cancel", func(t *testing.T) {
+		es, _ := elasticsearch.NewClient(elasticsearch.Config{Transport: &mockTransport{}})
+		bi, _ := NewBulkIndexer(BulkIndexerConfig{
+			NumWorkers: 1,
+			FlushBytes: 1,
+			Client:     es,
+		})
+		var (
+			customizedErr = errors.New("customized error")
+			ctx           = context.Background()
+		)
+		bi.CloseWithError(ctx, customizedErr)
+
+		err := bi.Add(context.Background(), BulkIndexerItem{Action: "foo"})
+		if !errors.Is(err, customizedErr) {
+			t.Errorf("Unexpected Add() error: want=%s, got=%s", customizedErr, err)
+		}
+
+		if err := bi.Close(ctx); err != nil {
+			t.Errorf("Unexpected Close() error: want=%v, got=%s", nil, err)
+		}
+	})
+
 	t.Run("Indexer Callback", func(t *testing.T) {
 		esCfg := elasticsearch.Config{
 			Transport: &mockTransport{

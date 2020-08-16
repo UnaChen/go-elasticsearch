@@ -20,6 +20,7 @@ import (
 
 	"github.com/elastic/go-elasticsearch/v7"
 	"github.com/elastic/go-elasticsearch/v7/esapi"
+	"github.com/pkg/errors"
 )
 
 // BulkIndexer represents a parallel, asynchronous, efficient indexer for Elasticsearch.
@@ -36,6 +37,9 @@ type BulkIndexer interface {
 
 	// Close waits until all added items are flushed and closes the indexer.
 	Close(context.Context) error
+
+	// Close with error reason immediately before Close(context.Context)
+	CloseWithError(context.Context, error)
 
 	// Stats returns indexer statistics.
 	Stats() BulkIndexerStats
@@ -159,10 +163,12 @@ type BulkIndexerDebugLogger interface {
 
 type bulkIndexer struct {
 	wg      sync.WaitGroup
+	mu      sync.Mutex
 	queue   chan BulkIndexerItem
 	workers []*worker
-	ticker  *time.Ticker
-	done    chan bool
+	done    bool
+	err     error
+	cancel  context.CancelFunc
 	stats   *bulkIndexerStats
 
 	config BulkIndexerConfig
@@ -210,11 +216,10 @@ func NewBulkIndexer(cfg BulkIndexerConfig) (BulkIndexer, error) {
 
 	bi := bulkIndexer{
 		config: cfg,
-		done:   make(chan bool),
 		stats:  &bulkIndexerStats{},
 	}
 
-	bi.init()
+	bi.start()
 
 	return &bi, nil
 }
@@ -224,8 +229,11 @@ func NewBulkIndexer(cfg BulkIndexerConfig) (BulkIndexer, error) {
 // Adding an item after a call to Close() will panic.
 //
 func (bi *bulkIndexer) Add(ctx context.Context, item BulkIndexerItem) error {
-	atomic.AddUint64(&bi.stats.numAdded, 1)
+	if bi.done {
+		return bi.err
+	}
 
+	atomic.AddUint64(&bi.stats.numAdded, 1)
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -235,13 +243,28 @@ func (bi *bulkIndexer) Add(ctx context.Context, item BulkIndexerItem) error {
 	return nil
 }
 
+// CloseWithError stops all workers with customized error reason immediately,
+// closes the indexer queue channel, drops unflushed items.
+//
+func (bi *bulkIndexer) CloseWithError(ctx context.Context, err error) {
+	bi.mu.Lock()
+	close(bi.queue)
+	bi.cancel()
+	bi.wg.Wait()
+	bi.err = err
+	bi.done = true
+	bi.mu.Unlock()
+}
+
 // Close stops the periodic flush, closes the indexer queue channel,
 // notifies the done channel and calls flush on all writers.
 //
 func (bi *bulkIndexer) Close(ctx context.Context) error {
-	bi.ticker.Stop()
+	if bi.done {
+		return nil
+	}
+
 	close(bi.queue)
-	bi.done <- true
 
 	select {
 	case <-ctx.Done():
@@ -252,12 +275,9 @@ func (bi *bulkIndexer) Close(ctx context.Context) error {
 
 	for _, w := range bi.workers {
 		var err error
-
-		w.mu.Lock()
 		if w.buf.Len() > 0 {
 			err = w.flushRetry(ctx)
 		}
-		w.mu.Unlock()
 
 		if err != nil && bi.config.OnFlushRetryError != nil {
 			bi.config.OnFlushRetryError(ctx, err)
@@ -283,9 +303,12 @@ func (bi *bulkIndexer) Stats() BulkIndexerStats {
 
 // init initializes the bulk indexer.
 //
-func (bi *bulkIndexer) init() {
-	bi.queue = make(chan BulkIndexerItem, bi.config.NumWorkers)
+func (bi *bulkIndexer) start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	bi.cancel = cancel
 
+	bi.queue = make(chan BulkIndexerItem, bi.config.NumWorkers)
+	bi.wg.Add(bi.config.NumWorkers)
 	for i := 1; i <= bi.config.NumWorkers; i++ {
 		w := worker{
 			id:  i,
@@ -293,38 +316,9 @@ func (bi *bulkIndexer) init() {
 			bi:  bi,
 			buf: bytes.NewBuffer(make([]byte, 0, bi.config.FlushBytes)),
 			aux: make([]byte, 0, 512)}
-		w.run()
+		w.run(ctx)
 		bi.workers = append(bi.workers, &w)
 	}
-	bi.wg.Add(bi.config.NumWorkers)
-
-	bi.ticker = time.NewTicker(bi.config.FlushInterval)
-	go func() {
-		ctx := context.Background()
-		for {
-			select {
-			case <-bi.done:
-				return
-			case <-bi.ticker.C:
-				if bi.config.DebugLogger != nil {
-					bi.config.DebugLogger.Printf("[indexer] Auto-flushing workers after %s\n", bi.config.FlushInterval)
-				}
-				for _, w := range bi.workers {
-					var err error
-
-					w.mu.Lock()
-					if w.buf.Len() > 0 {
-						err = w.flushRetry(ctx)
-					}
-					w.mu.Unlock()
-
-					if err != nil && bi.config.OnFlushRetryError != nil {
-						bi.config.OnFlushRetryError(ctx, err)
-					}
-				}
-			}
-		}
-	}()
 }
 
 // worker represents an indexer worker.
@@ -332,7 +326,7 @@ func (bi *bulkIndexer) init() {
 type worker struct {
 	id          int
 	ch          <-chan BulkIndexerItem
-	mu          sync.Mutex
+	ticker      *time.Ticker
 	bi          *bulkIndexer
 	buf         *bytes.Buffer
 	aux         []byte
@@ -342,73 +336,88 @@ type worker struct {
 
 // run launches the worker in a goroutine.
 //
-func (w *worker) run() {
-	go func() {
-		ctx := context.Background()
+func (w *worker) run(ctx context.Context) {
+	go func(ctx context.Context) {
+		defer w.bi.wg.Done()
 
 		if w.bi.config.DebugLogger != nil {
 			w.bi.config.DebugLogger.Printf("[worker-%03d] Started\n", w.id)
 		}
-		defer w.bi.wg.Done()
 
-		for item := range w.ch {
-			w.mu.Lock()
+		ticker := time.NewTicker(w.bi.config.FlushInterval)
+		defer ticker.Stop()
 
-			if w.bi.config.DebugLogger != nil {
-				w.bi.config.DebugLogger.Printf("[worker-%03d] Received item [%s:%s]\n", w.id, item.Action, item.DocumentID)
-			}
+		for {
+			select {
+			case <-ctx.Done():
+				return
 
-			w.writeMeta(item)
-
-			if err := w.writeBody(&item); err != nil {
-				w.failedItems = append(w.failedItems, item)
-				if item.OnFailure != nil {
-					item.OnFailure(ctx, item, BulkIndexerResponseItem{}, err)
+			case <-ticker.C:
+				if w.bi.config.DebugLogger != nil {
+					w.bi.config.DebugLogger.Printf("[worker-%03d] Auto-flushing workers after %s\n", w.id, w.bi.config.FlushInterval)
 				}
-				atomic.AddUint64(&w.bi.stats.numFailed, 1)
-				w.mu.Unlock()
-				continue
-			}
-			w.items = append(w.items, item)
 
-			var err error
-			if w.buf.Len() >= w.bi.config.FlushBytes {
-				err = w.flushRetry(ctx)
-			}
-			w.mu.Unlock()
+				if w.buf.Len() > 0 {
+					err := w.flushRetry(ctx)
+					if err != nil && w.bi.config.OnFlushRetryError != nil {
+						w.bi.config.OnFlushRetryError(ctx, err)
+					}
+				}
 
-			if err != nil && w.bi.config.OnFlushRetryError != nil {
-				w.bi.config.OnFlushRetryError(ctx, err)
+			case item, ok := <-w.ch:
+				if !ok {
+					return
+				}
+
+				if w.bi.config.DebugLogger != nil {
+					w.bi.config.DebugLogger.Printf("[worker-%03d] Received item [%s:%s]\n", w.id, item.Action, item.DocumentID)
+				}
+
+				w.writeMeta(item)
+
+				if err := w.writeBody(&item); err != nil {
+					w.failedItems = append(w.failedItems, item)
+					if item.OnFailure != nil {
+						item.OnFailure(ctx, item, BulkIndexerResponseItem{}, err)
+					}
+					atomic.AddUint64(&w.bi.stats.numFailed, 1)
+					continue
+				}
+				w.items = append(w.items, item)
+
+				if w.buf.Len() >= w.bi.config.FlushBytes {
+					err := w.flushRetry(ctx)
+					if err != nil && w.bi.config.OnFlushRetryError != nil {
+						w.bi.config.OnFlushRetryError(ctx, err)
+					}
+				}
 			}
 		}
-	}()
+
+	}(ctx)
+}
+
+func (w *worker) reset() {
+	w.items = nil
+	w.failedItems = nil
+	w.buf.Reset()
+
 }
 
 func (w *worker) flushRetry(ctx context.Context) error {
-	defer func() {
-		w.items = nil
-		w.failedItems = nil
-	}()
+	defer w.reset()
 
 	var count uint64
 	for {
-		flushBytes := uint64(w.buf.Len())
-
 		start := time.Now()
 		err := w.flush(ctx)
-		if err != nil {
-			w.failedItems = w.items
-		}
-
 		stats := BulkIndexerRetryStats{
 			Count:      count,
-			FlushBytes: flushBytes,
+			FlushBytes: uint64(w.buf.Len()),
 			NumAdded:   uint64(len(w.items)),
 			NumFailed:  uint64(len(w.failedItems)),
 			Duration:   uint64(time.Since(start).Milliseconds()),
 		}
-
-		w.items = nil
 
 		wait, goahead, err := w.bi.config.OnFlushRetry(ctx, stats, err)
 		if !goahead {
@@ -416,24 +425,19 @@ func (w *worker) flushRetry(ctx context.Context) error {
 		}
 		time.Sleep(wait)
 
-		w.writeFailedItems(ctx)
-		count++
-	}
-}
+		// retry for failed items
+		failedItems := w.failedItems
+		w.reset()
+		for _, item := range failedItems {
+			w.writeMeta(item)
 
-func (w *worker) writeFailedItems(ctx context.Context) {
-	failedItems := w.failedItems
-	w.failedItems = nil
-
-	for _, item := range failedItems {
-
-		w.writeMeta(item)
-
-		if err := w.writeBody(&item); err != nil {
-			w.failedItems = append(w.failedItems, item)
-			continue
+			if err := w.writeBody(&item); err != nil {
+				w.failedItems = append(w.failedItems, item)
+				continue
+			}
+			w.items = append(w.items, item)
 		}
-		w.items = append(w.items, item)
+		count++
 	}
 }
 
@@ -497,7 +501,13 @@ func (w *worker) writeBody(item *BulkIndexerItem) error {
 
 // flush writes out the worker buffer; it must be called under a lock.
 //
-func (w *worker) flush(ctx context.Context) error {
+func (w *worker) flush(ctx context.Context) (err error) {
+	defer func() {
+		if err != nil {
+			w.failedItems = append(w.failedItems, w.items...)
+		}
+	}()
+
 	if w.bi.config.OnFlushStart != nil {
 		ctx = w.bi.config.OnFlushStart(ctx)
 	}
@@ -510,17 +520,8 @@ func (w *worker) flush(ctx context.Context) error {
 		if w.bi.config.DebugLogger != nil {
 			w.bi.config.DebugLogger.Printf("[worker-%03d] Flush: Buffer empty\n", w.id)
 		}
-		return nil
+		return
 	}
-
-	var (
-		err error
-		blk BulkIndexerResponse
-	)
-
-	defer func() {
-		w.buf.Reset()
-	}()
 
 	if w.bi.config.DebugLogger != nil {
 		w.bi.config.DebugLogger.Printf("[worker-%03d] Flush: %s\n", w.id, w.buf.String())
@@ -549,7 +550,8 @@ func (w *worker) flush(ctx context.Context) error {
 	res, err := req.Do(ctx, w.bi.config.Client)
 	if err != nil {
 		atomic.AddUint64(&w.bi.stats.numFailed, uint64(len(w.items)))
-		return fmt.Errorf("flush: %s", err)
+		err = errors.Wrap(err, "flush")
+		return
 	}
 	if res.Body != nil {
 		defer res.Body.Close()
@@ -557,12 +559,16 @@ func (w *worker) flush(ctx context.Context) error {
 	if res.IsError() {
 		atomic.AddUint64(&w.bi.stats.numFailed, uint64(len(w.items)))
 		// TODO(karmi): Wrap error (include response struct)
-		return fmt.Errorf("flush: %s", res.String())
+		err = fmt.Errorf("flush: %s", res.String())
+		return
 	}
 
-	if err := w.bi.config.Decoder.UnmarshalFromReader(res.Body, &blk); err != nil {
+	var blk BulkIndexerResponse
+	err = w.bi.config.Decoder.UnmarshalFromReader(res.Body, &blk)
+	if err != nil {
 		// TODO(karmi): Wrap error (include response struct)
-		return fmt.Errorf("flush: error parsing response body: %s", err)
+		err = fmt.Errorf("flush: error parsing response body: %s", err)
+		return
 	}
 
 	for i, blkItem := range blk.Items {
@@ -571,7 +577,6 @@ func (w *worker) flush(ctx context.Context) error {
 			info BulkIndexerResponseItem
 			op   string
 		)
-
 		item = w.items[i]
 		// The Elasticsearch bulk response contains an array of maps like this:
 		//   [ { "index": { ... } }, { "create": { ... } }, ... ]
@@ -588,7 +593,6 @@ func (w *worker) flush(ctx context.Context) error {
 			}
 		} else {
 			atomic.AddUint64(&w.bi.stats.numFlushed, 1)
-
 			switch op {
 			case "index":
 				atomic.AddUint64(&w.bi.stats.numIndexed, 1)
@@ -606,7 +610,7 @@ func (w *worker) flush(ctx context.Context) error {
 		}
 	}
 
-	return err
+	return
 }
 
 type defaultJSONDecoder struct{}
