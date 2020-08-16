@@ -251,6 +251,10 @@ func (bi *bulkIndexer) Add(ctx context.Context, item BulkIndexerItem) error {
 // closes the indexer queue channel, drops unflushed items.
 //
 func (bi *bulkIndexer) CloseWithError(ctx context.Context, err error) {
+	if bi.done {
+		return
+	}
+
 	bi.mu.Lock()
 	close(bi.queue)
 	bi.cancel()
