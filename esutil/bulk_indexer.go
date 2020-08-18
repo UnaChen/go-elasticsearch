@@ -35,9 +35,6 @@ type BulkIndexer interface {
 
 	// Close waits until all added items are flushed and closes the indexer.
 	Close(context.Context) error
-
-	// Close with error reason immediately before Close(context.Context)
-	CloseWithError(context.Context, error)
 }
 
 // BulkIndexerConfig represents configuration of the indexer.
@@ -207,20 +204,6 @@ func (bi *bulkIndexer) Add(ctx context.Context, item BulkIndexerItem) error {
 	return nil
 }
 
-// CloseWithError stops all workers with customized error reason immediately,
-// closes the indexer queue channel, drops unflushed items.
-//
-func (bi *bulkIndexer) CloseWithError(ctx context.Context, err error) {
-	if bi.done {
-		return
-	}
-
-	bi.err = err
-	bi.done = true
-	close(bi.queue)
-	bi.wg.Wait()
-}
-
 // Close stops the periodic flush, closes the indexer queue channel,
 // notifies the done channel and calls flush on all writers.
 //
@@ -248,8 +231,9 @@ func (bi *bulkIndexer) Close(ctx context.Context) error {
 
 func (bi *bulkIndexer) start() {
 	bi.wg.Add(1)
-	go func() {
+	go func() (err error) {
 		defer bi.wg.Done()
+		defer bi.closeWithError(context.Background(), err)
 
 		ctx := context.Background()
 
@@ -260,16 +244,33 @@ func (bi *bulkIndexer) start() {
 
 			bi.writeMeta(item)
 			bi.writeBody(&item)
-
 			bi.items = append(bi.items, item)
 
 			if bi.buf.Len() >= bi.config.FlushBytes {
 				start := time.Now()
-				err := bi.flushRetry(ctx)
+				err = bi.flushRetry(ctx)
 				bi.config.OnFlushRetryEnd(ctx, time.Since(start).Milliseconds(), err)
+				if err != nil {
+					return
+				}
 			}
 		}
+		return
 	}()
+}
+
+// CloseWithError stops all workers with customized error reason immediately,
+// closes the indexer queue channel, drops unflushed items.
+//
+func (bi *bulkIndexer) closeWithError(ctx context.Context, err error) {
+	if bi.done {
+		return
+	}
+
+	bi.err = err
+	bi.done = true
+	close(bi.queue)
+	bi.wg.Wait()
 }
 
 func (bi *bulkIndexer) reset() {
