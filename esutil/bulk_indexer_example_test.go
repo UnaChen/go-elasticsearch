@@ -8,9 +8,7 @@ package esutil_test
 
 import (
 	"context"
-	"fmt"
 	"log"
-	"strings"
 	"time"
 
 	"github.com/elastic/go-elasticsearch/v7"
@@ -41,11 +39,15 @@ func ExampleNewBulkIndexer() {
 
 	// Create the indexer
 	//
+	var stats esutil.BulkIndexerRetryStats
 	indexer, err := esutil.NewBulkIndexer(esutil.BulkIndexerConfig{
 		Client:     es,     // The Elasticsearch client
 		Index:      "test", // The default index name
-		NumWorkers: 4,      // The number of worker goroutines (default: number of CPUs)
 		FlushBytes: 5e+6,   // The flush threshold in bytes (default: 5M)
+		OnFlushRetry: func(ctx context.Context, s esutil.BulkIndexerRetryStats, err error) (time.Duration, bool, error) {
+			stats = s
+			return 0, false, nil
+		},
 	})
 	if err != nil {
 		log.Fatalf("Error creating the indexer: %s", err)
@@ -63,29 +65,7 @@ func ExampleNewBulkIndexer() {
 			DocumentID: "1",
 
 			// Body is an `io.Reader` with the payload
-			Body: strings.NewReader(`{"title":"Test"}`),
-
-			// OnSuccess is the optional callback for each successful operation
-			OnSuccess: func(
-				ctx context.Context,
-				item esutil.BulkIndexerItem,
-				res esutil.BulkIndexerResponseItem,
-			) {
-				fmt.Printf("[%d] %s test/%s", res.Status, res.Result, item.DocumentID)
-			},
-
-			// OnFailure is the optional callback for each failed operation
-			OnFailure: func(
-				ctx context.Context,
-				item esutil.BulkIndexerItem,
-				res esutil.BulkIndexerResponseItem, err error,
-			) {
-				if err != nil {
-					log.Printf("ERROR: %s", err)
-				} else {
-					log.Printf("ERROR: %s: %s", res.Error.Type, res.Error.Reason)
-				}
-			},
+			Body: []byte(`{"title":"Test"}`),
 		},
 	)
 	if err != nil {
@@ -100,11 +80,10 @@ func ExampleNewBulkIndexer() {
 
 	// Report the indexer statistics
 	//
-	stats := indexer.Stats()
 	if stats.NumFailed > 0 {
-		log.Fatalf("Indexed [%d] documents with [%d] errors", stats.NumFlushed, stats.NumFailed)
+		log.Fatalf("Indexed [%d] documents with [%d] errors", stats.NumAdded, stats.NumFailed)
 	} else {
-		log.Printf("Successfully indexed [%d] documents", stats.NumFlushed)
+		log.Printf("Successfully indexed [%d] documents", stats.NumAdded)
 	}
 
 	// For optimal performance, consider using a third-party package for JSON decoding and HTTP transport.

@@ -66,8 +66,8 @@ func BenchmarkBulkIndexer(b *testing.B) {
 			docIDBuf.Write(docID)
 			bi.Add(context.Background(), esutil.BulkIndexerItem{
 				Action:     "index",
-				DocumentID: docIDBuf.String(),                  // 1x alloc
-				Body:       strings.NewReader(`{"foo":"bar"}`), // 1x alloc
+				DocumentID: docIDBuf.String(),       // 1x alloc
+				Body:       []byte(`{"foo":"bar"}`), // 1x alloc
 			})
 			docID = docID[:0]
 			docIDBuf.Reset()
