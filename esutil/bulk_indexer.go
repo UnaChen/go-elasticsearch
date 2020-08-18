@@ -163,12 +163,10 @@ type BulkIndexerDebugLogger interface {
 
 type bulkIndexer struct {
 	wg      sync.WaitGroup
-	mu      sync.Mutex
 	queue   chan BulkIndexerItem
 	workers []*worker
 	done    bool
 	err     error
-	cancel  context.CancelFunc
 	stats   *bulkIndexerStats
 
 	config BulkIndexerConfig
@@ -255,13 +253,10 @@ func (bi *bulkIndexer) CloseWithError(ctx context.Context, err error) {
 		return
 	}
 
-	bi.mu.Lock()
-	close(bi.queue)
-	bi.cancel()
-	bi.wg.Wait()
 	bi.err = err
 	bi.done = true
-	bi.mu.Unlock()
+	close(bi.queue)
+	bi.wg.Wait()
 }
 
 // Close stops the periodic flush, closes the indexer queue channel,
@@ -310,8 +305,7 @@ func (bi *bulkIndexer) Stats() BulkIndexerStats {
 // init initializes the bulk indexer.
 //
 func (bi *bulkIndexer) start() {
-	ctx, cancel := context.WithCancel(context.Background())
-	bi.cancel = cancel
+	ctx := context.Background()
 
 	bi.queue = make(chan BulkIndexerItem, bi.config.NumWorkers)
 	bi.wg.Add(bi.config.NumWorkers)
