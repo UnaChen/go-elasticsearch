@@ -190,7 +190,10 @@ func NewBulkIndexer(cfg BulkIndexerConfig) (BulkIndexer, error) {
 // Adding an item after a call to Close() will panic.
 //
 func (bi *bulkIndexer) Add(ctx context.Context, item BulkIndexerItem) error {
-	if bi.done {
+	if bi.err != nil {
+		if !bi.done {
+			bi.closeWithError(context.Background(), bi.err)
+		}
 		return bi.err
 	}
 
@@ -231,9 +234,8 @@ func (bi *bulkIndexer) Close(ctx context.Context) error {
 
 func (bi *bulkIndexer) start() {
 	bi.wg.Add(1)
-	go func() (err error) {
+	go func() {
 		defer bi.wg.Done()
-		defer bi.closeWithError(context.Background(), err)
 
 		ctx := context.Background()
 
@@ -248,14 +250,14 @@ func (bi *bulkIndexer) start() {
 
 			if bi.buf.Len() >= bi.config.FlushBytes {
 				start := time.Now()
-				err = bi.flushRetry(ctx)
+				err := bi.flushRetry(ctx)
 				bi.config.OnFlushRetryEnd(ctx, time.Since(start).Milliseconds(), err)
 				if err != nil {
+					bi.err = err
 					return
 				}
 			}
 		}
-		return
 	}()
 }
 
