@@ -240,6 +240,11 @@ func (bi *bulkIndexer) start() {
 		ctx := context.Background()
 
 		for item := range bi.queue {
+			// when flush fail, prevent close(bi.queue) immediately from locking bi.queue in Add()
+			if bi.err != nil {
+				continue
+			}
+
 			if bi.config.DebugLogger != nil {
 				bi.config.DebugLogger.Printf("[worker] Received item [%s:%s]\n", item.Action, item.DocumentID)
 			}
@@ -254,10 +259,11 @@ func (bi *bulkIndexer) start() {
 				bi.config.OnFlushRetryEnd(ctx, time.Since(start).Milliseconds(), err)
 				if err != nil {
 					bi.err = err
-					return
+					continue
 				}
 			}
 		}
+		return
 	}()
 }
 
