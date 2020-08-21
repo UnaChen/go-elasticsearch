@@ -293,11 +293,11 @@ func (bi *bulkIndexer) flushRetry(ctx context.Context) error {
 	var count uint64
 	for {
 		start := time.Now()
-
+		flushBytes := bi.buf.Len()
 		err := bi.flush(ctx)
 		stats := BulkIndexerRetryStats{
 			Count:      count,
-			FlushBytes: uint64(bi.buf.Len()),
+			FlushBytes: uint64(flushBytes),
 			NumAdded:   uint64(len(bi.items)),
 			NumFailed:  uint64(len(bi.failedItems)),
 			Duration:   uint64(time.Since(start).Milliseconds()),
